@@ -20,7 +20,6 @@ export default {
       return new Response("Not Found", { status: 404 });
     }
 
-    // 1. Verify postback secret token if configured
     if (env.POSTBACK_SECRET) {
       const providedToken = (
         url.searchParams.get("token") ||
@@ -32,7 +31,6 @@ export default {
       }
     }
 
-    // 2. Extract major parameters across MonetizeDeal, NexOffers, EarnIndia & TrishulCamps
     const clickId = (
       url.searchParams.get("click_id") ||
       url.searchParams.get("aff_click_id") ||
@@ -88,7 +86,6 @@ export default {
       const docRoot = `projects/${projectId}/databases/(default)/documents`;
       const baseDocUrl = `https://firestore.googleapis.com/v1/${docRoot}`;
 
-      // 3. Look up original click record
       const clickDoc = await getFirestoreDoc(
         `${baseDocUrl}/offerClicks/${encodeURIComponent(clickId)}`,
         accessToken
@@ -97,8 +94,15 @@ export default {
         return jsonResponse({ success: false, error: "Click ID not found", clickId }, 404);
       }
 
-      if (getStr(clickDoc.fields?.status) === "converted") {
-        return jsonResponse({ success: true, duplicate: true, message: "Click already credited", clickId }, 200);
+      const clickStatus = getStr(clickDoc.fields?.status);
+      if (clickStatus === "converted" || clickStatus === "payout_hold") {
+        return jsonResponse({
+          success: true,
+          duplicate: true,
+          status: clickStatus,
+          message: "Postback already recorded",
+          clickId
+        }, 200);
       }
 
       const userId = getStr(clickDoc.fields?.userId).trim();
@@ -107,7 +111,6 @@ export default {
         return jsonResponse({ success: false, error: "Incomplete click record" }, 400);
       }
 
-      // 4. Verify offer exists, is active, and has automatic postback enabled
       const offerDoc = await getFirestoreDoc(
         `${baseDocUrl}/offers/${encodeURIComponent(offerId)}`,
         accessToken
@@ -120,7 +123,6 @@ export default {
         return jsonResponse({ success: false, error: "Automatic postback is OFF for this offer", offerId }, 403);
       }
 
-      // 5. Check user account & prevent duplicate completion on same offer
       const userDoc = await getFirestoreDoc(
         `${baseDocUrl}/users/${encodeURIComponent(userId)}`,
         accessToken
@@ -139,10 +141,9 @@ export default {
         accessToken
       );
       if (getStr(existingUserTask?.fields?.status).toLowerCase() === "completed") {
-        return jsonResponse({ success: true, duplicate: true, message: "Task already marked completed", clickId }, 200);
+        return jsonResponse({ success: true, duplicate: true, message: "Task already completed", clickId }, 200);
       }
 
-      // 6. Deduplicate via deterministic postbackConversions doc when txnId is provided
       const safeTxnKey = txnId ? `txn_${encodeURIComponent(txnId)}` : "";
       if (safeTxnKey) {
         const existingConv = await getFirestoreDoc(
@@ -154,7 +155,6 @@ export default {
         }
       }
 
-      // 7. Compute safe reward amount (never negative, NaN, or over-inflated)
       const offerReward = roundMoney(getNum(offerDoc.fields?.reward));
       const networkPayout = Number.isFinite(rawPayout) && rawPayout > 0 ? roundMoney(rawPayout) : 0;
       const reward = offerReward > 0 ? offerReward : (networkPayout > 0 && networkPayout <= 10000 ? networkPayout : 0);
@@ -164,11 +164,15 @@ export default {
       }
 
       const offerName = getStr(offerDoc.fields?.name) || getStr(clickDoc.fields?.offerName) || "Offer";
+      const username =
+        getStr(userDoc.fields?.username) ||
+        getStr(userDoc.fields?.name) ||
+        getStr(userDoc.fields?.firstName) ||
+        userId;
       const nowIso = new Date().toISOString();
       const nowLabel = formatIndianNow();
-      const newTxnId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const queueDocId = `pbq_${encodeURIComponent(clickId)}`;
 
-      // 8. Commit all updates atomically in a single Firestore batch
       const writes = [];
 
       if (safeTxnKey) {
@@ -193,8 +197,8 @@ export default {
           name: `${docRoot}/offerClicks/${clickId}`,
           fields: {
             ...clickDoc.fields,
-            status: { stringValue: "converted" },
-            convertedAt: { timestampValue: nowIso },
+            status: { stringValue: "payout_hold" },
+            heldAt: { timestampValue: nowIso },
             txnId: { stringValue: txnId },
             eventName: { stringValue: eventName },
             networkOfferId: { stringValue: networkOfferId },
@@ -203,56 +207,24 @@ export default {
           }
         },
         updateMask: {
-          fieldPaths: ["status", "convertedAt", "txnId", "eventName", "networkOfferId", "convIp", "convTime"]
+          fieldPaths: ["status", "heldAt", "txnId", "eventName", "networkOfferId", "convIp", "convTime"]
         }
       });
 
       writes.push({
         update: {
-          name: `${docRoot}/userTasks/${userTaskDocId}`,
+          name: `${docRoot}/postbackQueue/${queueDocId}`,
           fields: {
-            ...(existingUserTask?.fields || {}),
-            userId: { stringValue: userId },
-            offerId: { stringValue: offerId },
-            status: { stringValue: "completed" },
-            completedAt: { timestampValue: nowIso }
-          }
-        },
-        updateMask: {
-          fieldPaths: ["userId", "offerId", "status", "completedAt"]
-        }
-      });
-
-      writes.push({
-        transform: {
-          document: `${docRoot}/users/${userId}`,
-          fieldTransforms: [
-            {
-              fieldPath: "balance",
-              increment: Number.isInteger(reward) ? { integerValue: String(reward) } : { doubleValue: reward }
-            },
-            {
-              fieldPath: "earned",
-              increment: Number.isInteger(reward) ? { integerValue: String(reward) } : { doubleValue: reward }
-            }
-          ]
-        }
-      });
-
-      writes.push({
-        update: {
-          name: `${docRoot}/transactions/${newTxnId}`,
-          fields: {
-            userId: { stringValue: userId },
-            category: { stringValue: "earnings" },
-            type: { stringValue: "completed" },
-            badge: { stringValue: "Task" },
-            amount: { doubleValue: reward },
-            title: { stringValue: `₹${reward.toFixed(2)} Cashback` },
-            subtitle: `Postback (${eventName}) - ${offerName}${txnId ? ` [${txnId}]` : ""}`,
-            txnId: { stringValue: txnId },
             clickId: { stringValue: clickId },
-            status: { stringValue: "Completed" },
+            userId: { stringValue: userId },
+            username: { stringValue: username },
+            offerId: { stringValue: offerId },
+            offerName: { stringValue: offerName },
+            reward: { doubleValue: reward },
+            txnId: { stringValue: txnId },
+            eventName: { stringValue: eventName },
+            convIp: { stringValue: convIp },
+            status: { stringValue: "pending" },
             date: { stringValue: nowLabel },
             createdAt: { timestampValue: nowIso }
           }
@@ -264,16 +236,20 @@ export default {
 
       return jsonResponse({
         success: true,
+        queued: true,
+        status: "pending",
         clickId,
         userId,
+        username,
         offerId,
+        offerName,
         event: eventName,
-        credited: reward
+        pendingAmount: reward
       }, 200);
     } catch (err) {
       const msg = String(err?.message || "");
       if (msg.includes("ALREADY_EXISTS") || msg.includes("409")) {
-        return jsonResponse({ success: true, duplicate: true, message: "Duplicate conversion ignored", clickId }, 200);
+        return jsonResponse({ success: true, duplicate: true, message: "Duplicate postback ignored", clickId }, 200);
       }
       return jsonResponse({ success: false, error: msg || "Postback processing error" }, 500);
     }
